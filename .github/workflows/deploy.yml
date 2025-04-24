@@ -106,6 +106,7 @@ jobs:
 
   governance_gate:
     name: 🔐 Gate de Governança
+    needs: [deploy]
     runs-on: self-hosted
 
     steps:
@@ -187,7 +188,7 @@ jobs:
           echo "DYNATRACE_ENV=$DT_ENV" >> $GITHUB_ENV
           echo "DYNATRACE_TOKEN=$DT_TOKEN" >> $GITHUB_ENV
 
-      - name: 📤 Envia evento de deployment
+      - name: 📤 Envia evento de deployment para Dynatrace
         run: |
           cd compliance
           make notify-governance
