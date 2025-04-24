@@ -108,6 +108,9 @@ jobs:
     name: 🔐 Gate de Governança
     needs: [deploy]
     runs-on: self-hosted
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
 
     steps:
       - name: 📦 Checkout do código
@@ -120,14 +123,21 @@ jobs:
 
       - name: 🔐 Obtém IP da EC2 e chave SSH do Vault
         run: |
+          echo "🔍 Testando conexão com Vault..."
+          if ! curl -s -k ${VAULT_ADDR}/v1/sys/health; then
+            echo "❌ Não foi possível conectar ao Vault"
+            exit 1
+          fi
+          
           echo "🔍 Obtendo IP da EC2 do Vault..."
-          VAULT_EC2=$(curl -s --header "X-Vault-Token: $VAULT_TOKEN" \
-            --request GET \
-            $VAULT_ADDR/v1/kv/data/ec2-ip)
+          if ! VAULT_EC2=$(curl -s -k -H "X-Vault-Token: ${VAULT_TOKEN}" ${VAULT_ADDR}/v1/kv/data/ec2-ip); then
+            echo "❌ Erro ao acessar o Vault"
+            exit 1
+          fi
           
           echo "📦 Obtendo secrets do Vault..."
           # Obter IP da EC2
-          RAW_IP=$(curl -s -k -H "X-Vault-Token: ${VAULT_TOKEN}" ${VAULT_ADDR}/v1/kv/data/ec2-ip | jq -r '.data.data.ip')
+          RAW_IP=$(echo "$VAULT_EC2" | jq -r '.data.data.ip')
           EC2_IP=$(echo "$RAW_IP" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
           
           # Validar IP
@@ -136,7 +146,7 @@ jobs:
             exit 1
           fi
           
-          echo "IP obtido: $EC2_IP"
+          echo "✅ IP obtido: $EC2_IP"
           echo "EC2_IP=$EC2_IP" >> $GITHUB_ENV
 
       - name: 🔑 Configura chave SSH
