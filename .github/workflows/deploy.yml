@@ -1,0 +1,193 @@
+name: Deploy to EC2
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Ambiente para deploy'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      reason:
+        description: 'Motivo do deploy manual'
+        required: true
+        type: string
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install make
+        run: |
+          sudo apt-get update && sudo apt-get install make
+
+      - name: Get Secrets from Vault
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          # Testar conexão com Vault
+          echo "🔍 Testando conexão com Vault..."
+          curl -s -k ${VAULT_ADDR}/v1/sys/health || (echo "❌ Não foi possível conectar ao Vault" && exit 1)
+          
+          echo "📦 Obtendo secrets do Vault..."
+          # Obter IP da EC2
+          RAW_IP=$(curl -s -k -H "X-Vault-Token: ${VAULT_TOKEN}" ${VAULT_ADDR}/v1/kv/data/ec2-ip | jq -r '.data.data.ip')
+          EC2_IP=$(echo "$RAW_IP" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+          
+          # Validar IP
+          if [[ ! $EC2_IP =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ IP inválido encontrado: $EC2_IP"
+            exit 1
+          fi
+          echo "✅ IP da EC2 encontrado: $EC2_IP"
+          echo "EC2_IP=$EC2_IP" >> $GITHUB_ENV
+          
+          # Obter chave SSH
+          echo "🔑 Obtendo chave SSH do Vault..."
+          curl -s -k -H "X-Vault-Token: ${VAULT_TOKEN}" ${VAULT_ADDR}/v1/kv/data/ssh-default | jq -r '.data.data.private_key' > private_key.pem
+          chmod 600 private_key.pem
+          echo "PRIVATE_KEY_PATH=$PWD/private_key.pem" >> $GITHUB_ENV
+          
+
+      - name: Setup and Test SSH Connection
+        run: |
+          echo "🔍 Verificando chave SSH..."
+          ls -la ${{ env.PRIVATE_KEY_PATH }}
+          echo "Primeiras linhas da chave:"
+          head -n 2 ${{ env.PRIVATE_KEY_PATH }}
+          
+          echo "🔧 Configurando SSH..."
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "Host ec2
+            HostName ${{ env.EC2_IP }}
+            User ubuntu
+            IdentityFile ${{ env.PRIVATE_KEY_PATH }}
+            StrictHostKeyChecking no
+            ServerAliveInterval 60
+            ServerAliveCountMax 10
+            TCPKeepAlive yes
+            ConnectTimeout 30
+            ConnectionAttempts 3" > ~/.ssh/config
+          
+          echo "📄 Configuração SSH:"
+          cat ~/.ssh/config
+          
+          echo "🔌 Testando conexão SSH com debug..."
+          ssh -vvv -o BatchMode=yes ec2 'echo "Conexão SSH bem sucedida!"' || (echo "❌ Erro na conexão SSH" && exit 1)
+
+      - name: Prepare EC2
+        run: |
+          echo "🔧 Preparando ambiente na EC2..."
+          ssh ec2 'sudo mkdir -p /repo && sudo chown ubuntu:ubuntu /repo'
+          ssh ec2 'cd /repo && git clone https://github.com/gaamaro/easytrade.git || (cd easytrade && git pull)'
+
+      - name: Deploy to EC2
+        run: |
+          cd startup
+          make deploy-all
+
+      - name: Log Deploy Info
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Deploy manual executado"
+          echo "Ambiente: ${{ github.event.inputs.environment }}"
+          echo "Motivo: ${{ github.event.inputs.reason }}" 
+
+  governance_gate:
+    name: 🔐 Gate de Governança
+    runs-on: self-hosted
+
+    steps:
+      - name: 📦 Checkout do código
+        uses: actions/checkout@v3
+
+      - name: 🧰 Instala dependências
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make curl
+
+      - name: 🔐 Obtém IP da EC2 e chave SSH do Vault
+        run: |
+          echo "🔍 Obtendo IP da EC2 do Vault..."
+          VAULT_EC2=$(curl -s --header "X-Vault-Token: $VAULT_TOKEN" \
+            --request GET \
+            $VAULT_ADDR/v1/kv/data/ec2-ip)
+          
+          # Pega apenas o primeiro IP encontrado
+          EC2_IP=$(echo "$VAULT_EC2" | jq -r '.data.data.ip' | head -n1 | tr -d '\n\r')
+          if [ -z "$EC2_IP" ]; then
+            echo "❌ Erro: Não foi possível obter o IP da EC2"
+            exit 1
+          fi
+          
+          # Valida se é um IP válido
+          if ! echo "$EC2_IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+            echo "❌ Erro: IP inválido obtido do Vault: $EC2_IP"
+            exit 1
+          fi
+          
+          echo "IP obtido: $EC2_IP"
+          echo "EC2_IP=$EC2_IP" >> $GITHUB_ENV
+
+      - name: 🔑 Configura chave SSH
+        run: |
+          echo "🔐 Obtendo chave SSH do Vault..."
+          VAULT_SSH=$(curl -s --header "X-Vault-Token: $VAULT_TOKEN" \
+            --request GET \
+            $VAULT_ADDR/v1/kv/data/ssh-default)
+          
+          PRIVATE_KEY=$(echo "$VAULT_SSH" | jq -r '.data.data.private_key')
+          if [ -z "$PRIVATE_KEY" ]; then
+            echo "❌ Erro: Não foi possível obter a chave SSH"
+            exit 1
+          fi
+          
+          echo "$PRIVATE_KEY" > /tmp/ssh_key
+          chmod 600 /tmp/ssh_key
+
+      - name: 🔍 Obtém HOST-ID do Dynatrace
+        run: |
+          echo "🔍 Obtendo HOST-ID via SSH..."
+          HOST_ID=$(ssh -i /tmp/ssh_key -o StrictHostKeyChecking=no ubuntu@$EC2_IP \
+            "sudo /opt/dynatrace/oneagent/agent/tools/oneagentctl --get-host-id" 2>/dev/null)
+          
+          if [ -z "$HOST_ID" ]; then
+            echo "❌ Erro: Não foi possível obter o HOST-ID"
+            exit 1
+          fi
+          
+          echo "✅ HOST-ID obtido: $HOST_ID"
+          echo "DT_HOST_ID=$HOST_ID" >> $GITHUB_ENV
+
+      - name: 🔐 Obtém credenciais Dynatrace do Vault
+        run: |
+          VAULT_DT=$(curl -s --header "X-Vault-Token: $VAULT_TOKEN" \
+            --request GET \
+            $VAULT_ADDR/v1/kv/data/dynatrace)
+          
+          DT_ENV=$(echo "$VAULT_DT" | jq -r '.data.data.env')
+          DT_TOKEN=$(echo "$VAULT_DT" | jq -r '.data.data.pipe_token')
+          
+          if [ -z "$DT_ENV" ] || [ -z "$DT_TOKEN" ]; then
+            echo "❌ Erro: Não foi possível obter as credenciais do Dynatrace"
+            exit 1
+          fi
+          
+          echo "DYNATRACE_ENV=$DT_ENV" >> $GITHUB_ENV
+          echo "DYNATRACE_TOKEN=$DT_TOKEN" >> $GITHUB_ENV
+
+      - name: 📤 Envia evento de deployment
+        run: |
+          cd compliance
+          make notify-governance
